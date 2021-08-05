@@ -91,6 +91,7 @@ func TestLeaderBcastBeat2AA(t *testing.T) {
 	r.becomeCandidate()
 	r.becomeLeader()
 
+	// 这条语句没什么作用
 	r.Step(pb.Message{MsgType: pb.MessageType_MsgPropose, Entries: []*pb.Entry{{}}})
 	r.readMessages() // clear message
 

@@ -35,4 +35,20 @@ TinyKv 的 Raft 实现几乎按照了 [Raft](https://willzhuang.github.io/2018/0
   - 接下来就是考虑 newRaft，我们根据参数 Config 实例化一个 raft 返回。需要注意新创建的 raft 一定是 follower，且 term = 0，以及初始化选举时间间隔
   - 这里我们也应该考虑 raft 宕机后重启的可能，以及初始化日志等情况，但在 leader 选举阶段可以先不考虑
 3. 处理 become 状态转变函数，要注意 send() 函数。它是 Raft 运转的核心枢纽，基本分为：接收消息 -> 根据当前 State 识别对应的消息 -> 调用处理函数 -> 返回消息
-  - 当前调用函数类型是 `MessageType_MsgAppend`，这是对当前 Raft 请求追加日志的消息
+  - 当前调用函数类型是 `MessageType_MsgAppend`，这是对当前 Leader 广播请求求追加日志的消息，则 Follower 和 Candidate 都需要处理，尤其 Candidate 此时转为 Follower。
+4. `TestLeaderBcastBeat2AA` 测试 Leader 的广播能力，这就设计 Leader 管理其他 Follower 的日志序号能力，我们需要把日志部分完善。
+  - 日志在 `raft/log.go` 中，对于日志中重要的几个节点：
+    - first：为什么要有 first 的记录呢，因为 first 虽说位置在第一位，但其日志编号不一定是第一个，因为前面可能还有快照。**于是我们要在 Log struct 中创建一个字段标记第一个日志编号是多少**
+    - applied：是已经应用的日志，不可改变，待称为快照
+    - committed：是 leader 已经经过半数节点同意的日志
+    - stabled：是已经接收的日志，但还没有决定是否采用，有可能会被覆盖
+  - 那么需要在 `becomeLeader()` 处补充 leader 对日志管理的记录，并且 leader 要广播一个空消息给其他 Follower 来宣布权威，所以记得将这条日志即时加上去
+5. `testNonleaderStartElection()` 比较简单，只需要考虑 tick 超时后处理相应的消息，把自己变成 candidate 和广播选举请求
+  - 【注】这里的消息 RPC 都发到自己的 `msgs []pb.Message` 中即可，后续有类 pd 程序将其提取和转发相应的节点
+6. `TestLeaderElectionInOneRoundRPC2AA()` 主要测试 candidate 接收其他节点对选举的响应设计，进而决定是称为 leader 还是转成 follower
+7. `TestFollowerVote2AA()` 测试节点接收请求投票 RPC 后是否对其投票
+  - 根据论文考虑 Term、是否已经投过票以及对方的日志比自己更多更新
+8. 对于超时的测试，只要在 tick 考虑到了超时归零以及随机 Timeout 就通过测试
+
+#### 问题
+1. 在测试 `TestLeaderCycle2AA()`  不通过：后发现其他测试都没有对接收日志作测试，导致这一步 follower 对广播的日志没有处理使得 raftlog 的 term 和 index 改变不正确，就导致第三轮 candidate 不能得到一半以上的投票而不能称为 leader

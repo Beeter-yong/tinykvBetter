@@ -50,13 +50,25 @@ type RaftLog struct {
 	pendingSnapshot *pb.Snapshot
 
 	// Your Data Here (2A).
+	FirstIndex uint64 // 记录 entries 中第一个日志的索引
 }
 
 // newLog returns log using the given storage. It recovers the log
 // to the state that it just commits and applies the latest snapshot.
 func newLog(storage Storage) *RaftLog {
 	// Your Code Here (2A).
-	return nil
+	lo, _ := storage.FirstIndex()
+	hi, _ := storage.LastIndex()
+	entries, _ := storage.Entries(lo, hi+1)
+
+	log := &RaftLog{
+		storage:    storage,
+		entries:    entries,
+		FirstIndex: lo,
+		stabled:    hi,
+		applied:    lo - 1,
+	}
+	return log
 }
 
 // We need to compact the log entries in some point of time like
@@ -69,23 +81,56 @@ func (l *RaftLog) maybeCompact() {
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
+	if len(l.entries) > 0 {
+		entrys := l.entries[l.stabled-l.FirstIndex+1:]
+		return entrys
+	}
 	return nil
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
+	if len(l.entries) > 0 {
+		entrys := l.entries[l.applied-l.FirstIndex+1 : l.committed-l.FirstIndex+1]
+		return entrys
+	}
 	return nil
 }
 
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
-	return 0
+	var index uint64
+	if !IsEmptySnap(l.pendingSnapshot) {
+		index = l.pendingSnapshot.Metadata.Index
+	}
+	if len(l.entries) > 0 {
+		return l.entries[len(l.entries)-1].Index
+	}
+	li, _ := l.storage.LastIndex()
+	return max(li, index)
 }
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
-	return 0, nil
+	if len(l.entries) > 0 && i >= l.FirstIndex {
+		return l.entries[i-l.FirstIndex].Term, nil
+	}
+	term, err := l.storage.Term(i)
+	if err == ErrUnavailable && !IsEmptySnap(l.pendingSnapshot) {
+		if i == l.pendingSnapshot.Metadata.Index {
+			term = l.pendingSnapshot.Metadata.Term
+			err = nil
+		} else if i < l.pendingSnapshot.Metadata.Index {
+			err = ErrCompacted
+		}
+	}
+	return term, nil
+}
+
+func (l *RaftLog) LastTerm() uint64 {
+	term, _ := l.Term(l.LastIndex())
+	return term
 }
