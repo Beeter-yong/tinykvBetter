@@ -366,7 +366,7 @@ func TestLeaderStartReplication2AB(t *testing.T) {
 	r := newTestRaft(1, []uint64{1, 2, 3}, 10, 1, s)
 	r.becomeCandidate()
 	r.becomeLeader()
-	commitNoopEntry(r, s)
+	commitNoopEntry(r, s) // 这里就有测试 leader 提交了，下一个测试就没用了
 	li := r.RaftLog.LastIndex()
 
 	ents := []*pb.Entry{{Data: []byte("some data")}}
@@ -850,7 +850,7 @@ func TestVoter2AA(t *testing.T) {
 // TestLeaderOnlyCommitsLogFromCurrentTerm tests that only log entries from the leader’s
 // current term are committed by counting replicas.
 // Reference: section 5.4.2
-func TestLeaderOnlyCommitsLogFromCurrentTerm2AB(t *testing.T) {
+func TestLeaderOnlyCommitsLogFromCurrentTerm2AB(t *testing.T) { // 并没有考虑 leader 切换导致多条日志不一致情况
 	ents := []pb.Entry{{Term: 1, Index: 1}, {Term: 2, Index: 2}}
 	tests := []struct {
 		index   uint64

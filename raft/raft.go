@@ -17,6 +17,7 @@ package raft
 import (
 	"errors"
 	"math/rand"
+	"sort"
 
 	"github.com/pingcap-incubator/tinykv/printlog"
 
@@ -182,7 +183,15 @@ func newRaft(c *Config) *Raft {
 		randomElectionTimeout: c.ElectionTick + rand.Intn(c.ElectionTick),
 	}
 
-	// 未考虑节点宕机后重新恢复的情况
+	hardState, confState, _ := c.Storage.InitialState()
+	raft.Term = hardState.Term
+	raft.Vote = hardState.Vote
+	raft.RaftLog.committed = hardState.Commit
+
+	if c.peers == nil {
+		c.peers = confState.Nodes
+	}
+
 	for _, p := range c.peers {
 		raft.Prs[p] = &Progress{}
 	}
@@ -197,7 +206,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 	if r.Prs[to].Next == 0 {
 		r.Prs[to].Next = 1
 	}
-	preIndex := r.Prs[to].Next - 1	// 找到上次发送给 peer 的日志位置
+	preIndex := r.Prs[to].Next - 1 // 找到上次发送给 peer 的日志位置
 	logTerm, err := r.RaftLog.Term(preIndex)
 
 	if err != nil {
@@ -349,6 +358,8 @@ func (r *Raft) Step(m pb.Message) error {
 	switch r.State {
 	case StateFollower:
 		switch m.MsgType {
+		case pb.MessageType_MsgHeartbeat:
+			r.handleHeartbeat(m)
 		case pb.MessageType_MsgRequestVote:
 			r.handleVote(m)
 		case pb.MessageType_MsgHup:
@@ -358,6 +369,9 @@ func (r *Raft) Step(m pb.Message) error {
 		}
 	case StateCandidate:
 		switch m.MsgType {
+		case pb.MessageType_MsgHeartbeat:
+			r.becomeFollower(m.Term, m.From)
+			r.handleHeartbeat(m)
 		case pb.MessageType_MsgRequestVote:
 			r.handleVote(m)
 		case pb.MessageType_MsgRequestVoteResponse:
@@ -370,14 +384,82 @@ func (r *Raft) Step(m pb.Message) error {
 		}
 	case StateLeader:
 		switch m.MsgType {
+		case pb.MessageType_MsgHeartbeatResponse:
+			r.handleHeartbeatResponse(m)
+		case pb.MessageType_MsgAppendResponse:
+			r.handleAppendEntriesResponse(m)
 		case pb.MessageType_MsgRequestVote:
 			r.handleVote(m)
 		case pb.MessageType_MsgPropose:
+			r.appendEntry(m)
 		case pb.MessageType_MsgBeat:
 			r.bcastHeart()
 		}
 	}
 	return nil
+}
+
+func (r *Raft) handleHeartbeatResponse(m pb.Message) {
+	if m.Term > r.Term {
+		return
+	}
+	r.sendAppend(m.From)
+}
+
+// Leader 处理 peer 发送的追加日志响应，需要即时更新自己的 commit index
+func (r *Raft) handleAppendEntriesResponse(m pb.Message) {
+	if m.Term != None && m.Term < r.Term {
+		return
+	}
+	if m.Reject {
+		// Follower 拒绝请求，表明 Leader 与该 follower 的日志有不同步，需要找到同步位置
+		r.Prs[m.From].Next = r.Prs[m.From].Next - uint64(1)
+		r.sendAppend(m.From)
+		return
+	}
+	// 如果 Forrowler 接收了请求，需要更新该节点的日志记录进度
+	r.Prs[m.From].Match = m.Index
+	r.Prs[m.From].Next = m.Index + 1
+	r.leaderCommit()
+}
+
+// leader 检验自身 commit index 是否更新
+func (r *Raft) leaderCommit() {
+	match := make(uint64Slice, len(r.Prs))
+	i := 0
+	for peer := range r.Prs {
+		match[i] = r.Prs[peer].Match
+		i++
+	}
+	sort.Sort(match)
+	n := match[(len(r.Prs)-1)/2] // 取所有节点中一半以上已经 commited 的位置
+	term, _ := r.RaftLog.Term(n) // 确保 commited 位置是当前 term 可控的
+	if n > r.RaftLog.committed && r.Term == term {
+		// 更改 Leader 提交的位置
+		logTerm, _ := r.RaftLog.Term(n)
+		if logTerm == r.Term {
+			r.RaftLog.committed = n
+			r.bcastAppend()
+		}
+	}
+}
+
+// Leader 处理客户端发来的日志条目
+func (r *Raft) appendEntry(m pb.Message) {
+	entries := m.Entries
+	for i, entrie := range entries {
+		// 将日志依次加在 RaftLog 中
+		entrie.Term = r.Term
+		entrie.Index = r.RaftLog.LastIndex() + uint64(i) + 1
+		r.RaftLog.entries = append(r.RaftLog.entries, *entrie)
+	}
+	// 添加日志后更改 Prs 中的记录进度
+	r.Prs[r.id].Next = r.RaftLog.LastIndex() + 1
+	r.Prs[r.id].Match = r.RaftLog.LastIndex()
+	r.bcastAppend()
+	if len(r.Prs) == 1 {
+		r.RaftLog.committed = r.Prs[r.id].Match
+	}
 }
 
 // candidate 收到 peer 的投票响应
@@ -458,14 +540,81 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	// r.randomElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
 	r.Lead = m.From
 
-	for _, entry := range m.Entries {
-		r.RaftLog.entries = append(r.RaftLog.entries, *entry)
+	if m.Index > r.RaftLog.LastIndex() {
+		// Follower 缺更多的日志待补全
+		r.sendAppendResponse(m.From, true)
+		return
 	}
+
+	logTerm, _ := r.RaftLog.Term(m.Index)
+	if logTerm != m.LogTerm {
+		r.sendAppendResponse(m.From, true)
+		return
+	}
+
+	// 需要考虑 1）追加的日志自己已经存在并已成快照；2）追加的日志是在 entry 后直接追加；3）追加的日志要覆盖自身一部分日志
+	for _, entry := range m.Entries {
+		if entry.Index < r.RaftLog.FirstIndex {
+			continue
+		}
+		if entry.Index <= r.RaftLog.LastIndex() {
+			idx := entry.Index - r.RaftLog.FirstIndex
+			if int(idx) >= len(r.RaftLog.entries) {
+				r.RaftLog.entries = append(r.RaftLog.entries, *entry)
+			}
+			if r.RaftLog.entries[idx].Term == entry.Term {
+				// 日志相同不需要再更改
+				continue
+			}
+			r.RaftLog.entries[idx] = *entry
+			r.RaftLog.entries = r.RaftLog.entries[:idx+1]
+			r.RaftLog.stabled = min(r.RaftLog.stabled, entry.Index-1)
+		} else {
+			r.RaftLog.entries = append(r.RaftLog.entries, *entry)
+		}
+	}
+
+	if m.Commit > r.RaftLog.committed {
+		r.RaftLog.committed = min(m.Commit, m.Index+uint64(len(m.Entries)))
+	}
+
+	r.sendAppendResponse(m.From, false)
+}
+
+func (r *Raft) sendAppendResponse(to uint64, reject bool) {
+	msg := pb.Message{
+		MsgType: pb.MessageType_MsgAppendResponse,
+		From:    r.id,
+		To:      to,
+		Term:    r.Term,
+		Reject:  reject,
+		Index:   r.RaftLog.LastIndex(),
+	}
+	r.msgs = append(r.msgs, msg)
+}
+
+func (r *Raft) sendHeartbeatResponse(to uint64, reject bool) {
+	mes := pb.Message{
+		MsgType: pb.MessageType_MsgHeartbeatResponse,
+		To:      to,
+		From:    r.id,
+		Term:    r.Term,
+		Reject:  reject,
+	}
+	r.msgs = append(r.msgs, mes)
 }
 
 // handleHeartbeat handle Heartbeat RPC request
 func (r *Raft) handleHeartbeat(m pb.Message) {
 	// Your Code Here (2A).
+	if m.Term < r.Term {
+		r.sendHeartbeatResponse(m.From, true)
+		return
+	}
+	r.Lead = m.From
+	r.electionElapsed = 0
+	r.randomElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
+	r.sendHeartbeatResponse(m.From, false)
 }
 
 // handleSnapshot handle Snapshot RPC request

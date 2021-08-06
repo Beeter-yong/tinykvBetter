@@ -51,4 +51,33 @@ TinyKv 的 Raft 实现几乎按照了 [Raft](https://willzhuang.github.io/2018/0
 8. 对于超时的测试，只要在 tick 考虑到了超时归零以及随机 Timeout 就通过测试
 
 #### 问题
-1. 在测试 `TestLeaderCycle2AA()`  不通过：后发现其他测试都没有对接收日志作测试，导致这一步 follower 对广播的日志没有处理使得 raftlog 的 term 和 index 改变不正确，就导致第三轮 candidate 不能得到一半以上的投票而不能称为 leader
+1. 在测试 `TestLeaderCycle2AA()`  不通过：后发现其他测试都没有对接收日志作测试，导致这一步 follower 对广播的日志没有处理使得 raftlog 的 term 和 index 改变不正确，就导致第三轮 candidate 不能得到一半以上的投票而不能称为 leader。
+   1. 解决：只要对 leader 的广播日志追加到自己的日志后面即可解决问题，等下一步日志复制时这一步会很重要，会再细化。
+
+### Code - Log replication
+raft 另一重要部分。这其中有几个重要点：1）client 都是将请求发给 Leader 的，由 Leader 广播日志；2）Leader 决定一个日志是否提交（提交条件是**本任期内**过半节点响应 RPC）；3）Leader 发送消息携带自己已经提交的索引号，Follower 根据此决定自身的提交索引位置
+
+1. client 的提议请求消息类型是 `pb.MessageType_MsgPropose`，则 Leader 自己追加日志并广播出去。
+2. 记得完成 Follower 追加了 Leader 广播的日志后会给出响应，需要对此处理，重点是 Leader 需要决定自己的 commit index 是否需要更新
+3. `TestFollowerCommitEntry2AB()` 测试考察 follower 根据 leader 发来的消息中的 committed 来更新自己的 committed 位置。这里就需要进一步补充 project2aa 部分最后待完善的 follower 日志追加函数。即更新 committed，但还有如果日志不合适需要拒绝响应没有完善
+   ```
+   if m.Commit > r.RaftLog.committed {
+		r.RaftLog.committed = min(m.Commit, m.Index+uint64(len(m.Entries)))
+	}
+   ```
+4. `TestFollowerCheckMessageType_MsgAppend2AB()` 同上个测试都是对 folower 接收日志功能测试，这部分完善 leader 发来的日志起始位置与自己不匹配而拒绝
+5. `TestLeaderElectionOverwriteNewerLogs2AB()` 这个测试考虑情况复杂，涉及到 Raft 论文 5.4.2 Figure8 的情况
+   - 【注】：`entsWithConfig()` 和 `votedWithConfig()` 都是在创建 Raft 时设定了一定的配置条件，前者对日志进行配置，后者对状态进行了设置，尤其后者，有 `storage.SetHardState(pb.HardState{Vote: vote, Term: term})`。所以需要在 `NewRaft()` 处考虑初始化时得到这些信息
+   - 如下代码模拟了 figure8 的 a、b 两种情形，而后考虑 c 图情况
+    ```go
+    n := newNetworkWithConfig(cfg,
+		entsWithConfig(cfg, 1),     // Node 1: Won first election
+		entsWithConfig(cfg, 1),     // Node 2: Got logs from node 1
+		entsWithConfig(cfg, 2),     // Node 3: Won second election
+		votedWithConfig(cfg, 3, 2), // Node 4: Voted but didn't get logs
+		votedWithConfig(cfg, 3, 2)) // Node 5: Voted but didn't get logs
+    ```
+
+#### 问题
+1. 虽然测试了新 leader 覆盖之前任期的日志，但仍没有考虑 5.4.2 的 d、e 情况
+2. `raft_test.go` 中很多测试没研究就可以通过 
