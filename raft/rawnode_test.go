@@ -157,6 +157,7 @@ func TestRawNodeProposeAddDuplicateNode3A(t *testing.T) {
 
 // TestRawNodeStart ensures that a node can be started correctly, and can accept and commit
 // proposals.
+// HasReady（）测试不完善，只反回 false 即可通过测试，没有分析不同具体情况
 func TestRawNodeStart2AC(t *testing.T) {
 	storage := NewMemoryStorage()
 	rawNode, err := NewRawNode(newTestConfig(1, []uint64{1}, 10, 1, storage))
@@ -165,7 +166,7 @@ func TestRawNodeStart2AC(t *testing.T) {
 	}
 	rawNode.Campaign()
 	rd := rawNode.Ready()
-	storage.Append(rd.Entries)
+	storage.Append(rd.Entries) // user 处理具体日志或消息
 	rawNode.Advance(rd)
 
 	rawNode.Propose([]byte("foo"))

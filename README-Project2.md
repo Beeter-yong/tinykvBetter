@@ -81,3 +81,26 @@ raft 另一重要部分。这其中有几个重要点：1）client 都是将请�
 #### 问题
 1. 虽然测试了新 leader 覆盖之前任期的日志，但仍没有考虑 5.4.2 的 d、e 情况
 2. `raft_test.go` 中很多测试没研究就可以通过 
+
+### Code - Raw node interface
+TinyKv 是在单机 RocksDB（badger）之上使用 Raft 来实现分布式部署的，我们通过 project2a 和 2b 基本完成了 Raft 功能，但上层应用使用 Raft 是无需知道选举、日志、心跳等具体细节的，所以要对 Raft 的操作进行封装，提供给上层应用使用 Raft 的基本接口即可。比如产生一个节点 `NewRawNode()`，逻辑时钟的走动 `RawNode.Tick()`，客户端的请求 `RawNode.Propose()`，消息 RPC 传送 `RawNode.Step()` 等。
+
+1. 这部分测试函数只有两个在 `raft/rawnode.go` 内，测试关注点是集群节点启动以及接收 client 的提议请求和正常的日志处理等。
+2. 首先根据测试代码，需要先实现 `NewRawNode()` 函数，而这个函数需要自定义结构体，我们知道它必会初始化一个 Raft，但其他字段怎么设计，我们可以参考 [etcd rawnode](https://github.com/etcd-io/etcd/blob/main/raft/rawnode.go) 
+   ```go
+   type RawNode struct {
+    raft       *raft
+    prevSoftSt *SoftState
+    prevHardSt pb.HardState
+   }
+   ```
+- 其中 HardState 我们在 2b 中已经用到过，作用是记录一个 Raft 节点的日志状态并持久化保存，用于节点重启后恢复状态，比如 Term、CommitedIndex 等
+- 而 SoftState 是一个通用 struct，可保存除 HardState 之外的不需要持久化保存的**易变**内容
+3. 除了 `NewRawNode()` 之外还需要 code 的是三个函数 `Ready()`、`HasReady()`、`Advance()`。这其中要不返回字段 Ready，要不传入字段 Ready，则要对 Ready 先有深刻认识。
+- 根据注释，Ready 字段封装有 client 准备去读 1）Entries：已经稳定存储 Raft 节点的日志；2）CommittedEntries：已经提交且待 apply 的日志；3）Messages：发送给其他节点的消息
+- `Ready()` 就是给 client 返回当前 Ready 信息，来供 client 进一步使用调度
+- `HasReady()` 是 client 用来检测 Ready 有无更新，如果有就需要即时处理
+- `Advance()` 通过 `HasReay()` 得知节点有日志或消息需要处理，通过 `Ready()` 得到待处理的消息或日志，最后通过 `Advance()` 去即时更新这些日志或消息（但它并不处理日志和消息，具体处理由 client 完成）。
+
+#### 问题
+1. 在 `TestRawNodeRestart2AC()` 测试中，对 `Ready()` 函数结果的测试，发现 Ready 返回结果中包含了不必要的字段，如 SoftState 或初始化了 msg 都回认为出现错误

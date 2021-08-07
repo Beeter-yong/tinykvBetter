@@ -199,6 +199,24 @@ func newRaft(c *Config) *Raft {
 	return raft
 }
 
+// 获取 Raft 节点需要持久化保存的字段内容
+func (r *Raft) getHardState() pb.HardState {
+	hardState := pb.HardState{
+		Term:   r.Term,
+		Vote:   r.Vote,
+		Commit: r.RaftLog.committed,
+	}
+	return hardState
+}
+
+// 获取 Raft 节点易失性重要字段
+func (r *Raft) getSoftState() *SoftState {
+	softState := &SoftState{
+		Lead: r.id,
+	}
+	return softState
+}
+
 // sendAppend sends an append RPC with new entries (if any) and the
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {

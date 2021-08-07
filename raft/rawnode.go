@@ -70,12 +70,20 @@ type Ready struct {
 type RawNode struct {
 	Raft *Raft
 	// Your Data Here (2A).
+	prevSoftSt *SoftState
+	prevHardSt pb.HardState
 }
 
 // NewRawNode returns a new RawNode given configuration and a list of raft peers.
 func NewRawNode(config *Config) (*RawNode, error) {
 	// Your Code Here (2A).
-	return nil, nil
+	raft := newRaft(config)
+
+	rawNode := RawNode{
+		Raft:       raft,
+		prevHardSt: raft.getHardState(),
+	}
+	return &rawNode, nil
 }
 
 // Tick advances the internal logical clock by a single tick.
@@ -143,12 +151,42 @@ func (rn *RawNode) Step(m pb.Message) error {
 // Ready returns the current point-in-time state of this RawNode.
 func (rn *RawNode) Ready() Ready {
 	// Your Code Here (2A).
-	return Ready{}
+	raft := rn.Raft
+	ready := Ready{
+		Entries:          raft.RaftLog.unstableEntries(),
+		CommittedEntries: raft.RaftLog.nextEnts(),
+		Messages:         raft.msgs,
+	}
+
+	raft.msgs = make([]pb.Message, 0) // 消息提取出来后就把 Raft 节点的消息清空
+
+	rn.prevSoftSt = raft.getSoftState()
+	hardState := raft.getHardState()
+
+	if !isHardStateEqual(hardState, rn.prevHardSt) {
+		// 即时更新持久化节点字段 hardState 更新
+		ready.HardState = hardState
+	}
+
+	return ready
 }
 
 // HasReady called when RawNode user need to check if any Ready pending.
 func (rn *RawNode) HasReady() bool {
 	// Your Code Here (2A).
+	r := rn.Raft
+
+	// 如果 preHardState 与当前 hardState 不一致表明有新的选举等情况发生
+	if hardSt := r.getHardState(); !IsEmptyHardState(hardSt) && !isHardStateEqual(hardSt, rn.prevHardSt) {
+		return true
+	}
+
+	// 有日志或消息需要进一步处理
+	if len(r.RaftLog.unstableEntries()) > 0 ||
+		len(r.RaftLog.nextEnts()) > 0 ||
+		len(r.msgs) > 0 {
+		return true
+	}
 	return false
 }
 
@@ -156,6 +194,16 @@ func (rn *RawNode) HasReady() bool {
 // last Ready results.
 func (rn *RawNode) Advance(rd Ready) {
 	// Your Code Here (2A).
+	// 这里并不处理日志或消息，具体处理有 user 完成，这里只是在 user 处理后即时更新索引等
+	if len(rd.Entries) > 0 {
+		rn.Raft.RaftLog.stabled = rd.Entries[len(rd.Entries)-1].Index
+	}
+	if len(rd.CommittedEntries) > 0 {
+		rn.Raft.RaftLog.applied = rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
+	}
+	if !IsEmptyHardState(rd.HardState) {
+		rn.prevHardSt = rd.HardState
+	}
 }
 
 // GetProgress return the the Progress of this node and its peers, if this
